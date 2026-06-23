@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="es">
  <head>
@@ -1260,18 +1261,19 @@ if (formConfigAdmin) {
 
       document.getElementById('modal-nombre-alumno').textContent = `${alumno.nombre_completo} (${alumno.numero_control})`;
 
-      // NUEVO: Le asignamos la función de descarga al botón con el ID de este alumno
       const btnDescargar = document.getElementById('btn-descargar-historial');
       if (btnDescargar) {
           btnDescargar.onclick = () => descargarBoletaIndividualPDF(alumnoId);
       }
 
-      // Filtramos todas las calificaciones existentes de este alumno
-      const calificaciones = allData.filter(d => d.type === 'calificacion' && d.alumno_id === alumnoId);
+      // SOLUCIÓN: Filtramos para que ignore calificaciones "fantasma" de grupos borrados
+      const gruposValidosIds = allData.filter(d => d.type === 'grupo').map(g => g.__backendId);
+      const calificaciones = allData.filter(d => d.type === 'calificacion' && d.alumno_id === alumnoId && gruposValidosIds.includes(d.grupo_id));
+      
       const tbody = document.getElementById('modal-body-calificaciones');
 
       if (calificaciones.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-500 text-sm">El alumno no tiene calificaciones registradas.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" class="py-8 text-center text-gray-500 text-sm">El alumno no tiene calificaciones registradas válidas.</td></tr>';
       } else {
         tbody.innerHTML = calificaciones.map(calif => {
           const p1 = calif.parcial_1 ?? '-';
@@ -1300,16 +1302,17 @@ if (formConfigAdmin) {
     }
 
 
-function descargarBoletaIndividualPDF(alumnoId) {
+    function descargarBoletaIndividualPDF(alumnoId) {
       const alumno = allData.find(a => a.__backendId === alumnoId);
       if (!alumno) return;
 
-      const calificaciones = allData.filter(d => d.type === 'calificacion' && d.alumno_id === alumnoId);
+      // SOLUCIÓN: Mismo filtro en el PDF para evitar fantasmas
+      const gruposValidosIds = allData.filter(d => d.type === 'grupo').map(g => g.__backendId);
+      const calificaciones = allData.filter(d => d.type === 'calificacion' && d.alumno_id === alumnoId && gruposValidosIds.includes(d.grupo_id));
 
       const { jsPDF } = window.jspdf; 
       const doc = new jsPDF();
       
-      // Reutilizamos tu función de encabezado
       dibujarEncabezadoTecNM(doc);
 
       doc.setFont('helvetica', 'bold'); 
@@ -1344,7 +1347,6 @@ function descargarBoletaIndividualPDF(alumnoId) {
               styles: { fontSize: 9, cellPadding: 2, halign: 'center' }, 
               columnStyles: { 1: { halign: 'left' } },
               didParseCell: function(data) {
-                  // Colorear el texto de APROBADO / REPROBADO
                   if (data.section === 'body' && data.column.index === 7) {
                       if (data.cell.raw === 'APROBADO') data.cell.styles.textColor = [0, 128, 0];
                       if (data.cell.raw === 'REPROBADO') data.cell.styles.textColor = [255, 0, 0];
@@ -1353,7 +1355,6 @@ function descargarBoletaIndividualPDF(alumnoId) {
           });
       }
 
-      // Generar nombre de archivo limpio
       const nombreArchivo = `Historial_${alumno.numero_control}_${alumno.nombre_completo.replace(/\s+/g, '_')}.pdf`;
       doc.save(nombreArchivo); 
       showToast('Historial en PDF descargado correctamente');
@@ -1997,11 +1998,44 @@ document.getElementById('form-grupo').addEventListener('submit', async function(
       btn.disabled = false; 
     });
     function deleteGrupo(id) {
-      const grupo = allData.find(d => d.__backendId === id); if (!grupo) return;
+      const grupo = allData.find(d => d.__backendId === id); 
+      if (!grupo) return;
+      
       const alumnosInGrupo = getAlumnosByGrupo(id);
-      if (alumnosInGrupo.length > 0) { showToast(`No se puede eliminar el grupo porque tiene ${alumnosInGrupo.length} alumno(s) asignado(s)`, 'error'); return; }
-      showConfirmModal('Eliminar Grupo', `¿Estás seguro de eliminar el grupo "${grupo.grupo_nombre}"?`, 'Eliminar', 'bg-red-600 hover:bg-red-700', async () => {
-        await storage.deleteRecord(id); await loadAllData(); showToast('Grupo eliminado correctamente');
+      
+      // Cambiamos el mensaje si el grupo tiene alumnos para advertir del borrado forzoso
+      let mensaje = `¿Estás seguro de eliminar el grupo "${grupo.grupo_nombre}"?`;
+      if (alumnosInGrupo.length > 0) {
+          mensaje = `⚠️ ADVERTENCIA: Este grupo tiene ${alumnosInGrupo.length} alumno(s). Al eliminarlo de forma forzosa, se borrarán TODAS sus calificaciones de este módulo y los alumnos quedarán sin grupo. ¿Deseas continuar?`;
+      }
+
+      // Llamamos al modal de confirmación
+      showConfirmModal('Eliminar Grupo (Forzoso)', mensaje, 'Sí, Eliminar Todo', 'bg-red-600 hover:bg-red-800', async () => {
+        
+        // 1. Buscar y eliminar todas las calificaciones vinculadas a este grupo (se pierde el historial)
+        const calificacionesDelGrupo = getCalificacionesByGrupo(id);
+        for (const calif of calificacionesDelGrupo) {
+            await storage.deleteRecord(calif.__backendId);
+        }
+
+        // 2. Desasignar a los alumnos para que no se queden en un grupo "fantasma"
+        for (const alumno of alumnosInGrupo) {
+            alumno.grupo_id = "";
+            alumno.grupo_nombre = "Sin grupo";
+            await storage.updateRecord(alumno);
+        }
+
+        // 3. Finalmente, eliminar el registro del grupo
+        await storage.deleteRecord(id); 
+        
+        // 4. Si estábamos editando este mismo grupo, cancelamos la edición
+        if (typeof editGrupoId !== 'undefined' && editGrupoId === id) {
+            cancelarEdicionGrupo();
+        }
+        
+        // Recargar la vista
+        await loadAllData(); 
+        showToast('Grupo y calificaciones eliminados forzosamente', 'success');
       });
     }
 
@@ -2649,6 +2683,7 @@ document.getElementById('form-grupo').addEventListener('submit', async function(
     let chartPromediosInstance = null;
     let chartEstadoInstance = null;
 
+   
     function renderDashCharts() {
       // 1. Preparar datos para la gráfica de Barras (Promedios por Módulo)
       const modulos = ['1-2', '3-4', '5-6', '7-8', '9-10'];
@@ -2666,7 +2701,12 @@ document.getElementById('form-grupo').addEventListener('submit', async function(
       });
 
       // 2. Preparar datos para la gráfica de Dona (Estado Global)
-      const todasCalifs = allData.filter(d => d.type === 'calificacion');
+      // SOLUCIÓN: Obtenemos los IDs de los grupos que SÍ existen actualmente
+      const gruposValidosIds = allData.filter(d => d.type === 'grupo').map(g => g.__backendId);
+      
+      // Filtramos las calificaciones para que solo incluya las de grupos válidos
+      const todasCalifs = allData.filter(d => d.type === 'calificacion' && gruposValidosIds.includes(d.grupo_id));
+      
       let aprobados = 0, reprobados = 0, sinCalificar = 0;
       
       todasCalifs.forEach(c => {
@@ -2701,23 +2741,11 @@ document.getElementById('form-grupo').addEventListener('submit', async function(
           maintainAspectRatio: false,
           plugins: {
             legend: { display: false },
-            tooltip: {
-              backgroundColor: 'rgba(17, 24, 39, 0.9)',
-              padding: 12,
-              cornerRadius: 8
-            }
+            tooltip: { backgroundColor: 'rgba(17, 24, 39, 0.9)', padding: 12, cornerRadius: 8 }
           },
           scales: {
-            y: {
-              beginAtZero: true,
-              max: 100,
-              grid: { borderDash: [4, 4], color: '#f3f4f6' },
-              border: { display: false }
-            },
-            x: {
-              grid: { display: false },
-              border: { display: false }
-            }
+            y: { beginAtZero: true, max: 100, grid: { borderDash: [4, 4], color: '#f3f4f6' }, border: { display: false } },
+            x: { grid: { display: false }, border: { display: false } }
           }
         }
       });
@@ -2732,11 +2760,7 @@ document.getElementById('form-grupo').addEventListener('submit', async function(
           labels: ['Aprobados', 'Reprobados', 'Sin Calificar'],
           datasets: [{
             data: [aprobados, reprobados, sinCalificar],
-            backgroundColor: [
-              'rgba(16, 185, 129, 0.8)', // Verde
-              'rgba(239, 68, 68, 0.8)',  // Rojo
-              'rgba(156, 163, 175, 0.8)' // Gris
-            ],
+            backgroundColor: ['rgba(16, 185, 129, 0.8)', 'rgba(239, 68, 68, 0.8)', 'rgba(156, 163, 175, 0.8)'],
             borderWidth: 0,
             hoverOffset: 4
           }]
@@ -2746,15 +2770,8 @@ document.getElementById('form-grupo').addEventListener('submit', async function(
           maintainAspectRatio: false,
           cutout: '75%', // Hace la dona más delgada (moderno)
           plugins: {
-            legend: {
-              position: 'bottom',
-              labels: { usePointStyle: true, padding: 20 }
-            },
-            tooltip: {
-              backgroundColor: 'rgba(17, 24, 39, 0.9)',
-              padding: 12,
-              cornerRadius: 8
-            }
+            legend: { position: 'bottom', labels: { usePointStyle: true, padding: 20 } },
+            tooltip: { backgroundColor: 'rgba(17, 24, 39, 0.9)', padding: 12, cornerRadius: 8 }
           }
         }
       });
